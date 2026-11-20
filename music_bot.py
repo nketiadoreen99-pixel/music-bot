@@ -573,7 +573,10 @@ def main() -> None:
     app.add_error_handler(handle_error)
 
     logger.info("Bot starting — polling for updates…")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,  # make sure button taps (callback_query) are delivered
+    )
 
 
 if __name__ == "__main__":
