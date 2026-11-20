@@ -87,6 +87,7 @@ def sc_search(query: str, limit: int = SC_SEARCH_LIMIT) -> list[dict[str, Any]]:
     webpage_url, duration, thumbnail.
     """
     search_url = f"scsearch{limit}:{query}"
+    logger.info("Searching SoundCloud: %s", query)
     ydl_opts: dict[str, Any] = {
         "quiet":       False,
         "no_warnings": False,

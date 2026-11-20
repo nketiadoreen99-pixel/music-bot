@@ -1,22 +1,20 @@
-# Telegram YouTube Music Bot
+# Telegram Music Bot (SoundCloud)
 
-Searches YouTube Music (via the unofficial `ytmusicapi`) and sends the audio
-file directly to the user's Telegram chat using `yt-dlp` for downloading.
+Searches SoundCloud via yt-dlp and sends the audio file directly to the user's Telegram chat.
 
 ## Features
 
-- Search by any text — song name, artist, or both (`Song - Artist`)
-- `/search` command for step-by-step prompts
-- Results shown as an inline keyboard — tap any result to download it
-- Audio sent as a Telegram audio file (saved in the user's chat)
-- Cleans up temp files after every send
-- Works without FFmpeg (falls back to raw audio); with FFmpeg installed it
-  remuxes to MP3 at 192 kbps for best Telegram player compatibility
+- Search by any text — song name, artist, or both
+- Paste a SoundCloud track URL to download it directly
+- Results shown as an inline keyboard — tap any result to see details and download
+- Audio sent as a Telegram audio file (MP3, saved in the user's chat)
+- Cleans up `/tmp` after every send
+- FFmpeg converts to MP3 at 192 kbps; works without FFmpeg too (sends native format)
 
 ## Requirements
 
 - Python 3.10 or newer
-- FFmpeg on PATH is **recommended** (for MP3 conversion) but optional
+- FFmpeg on PATH (recommended — installed automatically on Railway via `nixpacks.toml`)
 
 ## Setup
 
@@ -31,7 +29,7 @@ file directly to the user's Telegram chat using `yt-dlp` for downloading.
 3. Set the token and start:
 
    ```powershell
-   $env:TELEGRAM_BOT_TOKEN = "paste-your-token-here"
+   $env:TELEGRAM_BOT_TOKEN = "your-token-here"
    python music_bot.py
    ```
 
@@ -42,18 +40,13 @@ file directly to the user's Telegram chat using `yt-dlp` for downloading.
 | Action | How |
 |---|---|
 | Search | Type any song name or `Song - Artist` |
-| Step-by-step | `/search` then type the name when prompted |
-| Download | Tap a result button — the audio arrives as a file |
-| Cancel | `/cancel` during a search conversation |
+| Step-by-step | `/search` then type when prompted |
+| Direct URL | Paste a `soundcloud.com` track URL |
+| Download | Tap a result → tap **Download & Send Audio** |
+| Cancel | `/cancel` during a search |
 
-## Notes
+## Deploy on Railway
 
-- Telegram bots can upload files up to **50 MB**. Tracks longer than ~1 hour
-  may be rejected; the bot will tell you if that happens.
-- The bot uses long polling — no public URL or webhook is needed.
-- Keep `TELEGRAM_BOT_TOKEN` out of source code and version control.
-
-## Deploy
-
-Run `python music_bot.py` on any machine with outbound internet access and set
-`TELEGRAM_BOT_TOKEN` as an environment variable or secret in your host's config.
+Push this repo to GitHub, connect it to Railway, and set `TELEGRAM_BOT_TOKEN`
+as an environment variable. `nixpacks.toml` installs FFmpeg automatically.
+The bot uses long polling — no webhook or public URL needed.
