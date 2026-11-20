@@ -87,73 +87,146 @@ def ytm_search(query: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
 
 # ── yt-dlp audio download ─────────────────────────────────────────────────────
 
+# User-agent that resembles a real browser to reduce YouTube bot-detection hits
+_YT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# If YTDL_PROXY is set in the environment (e.g. on Railway), pass it to yt-dlp
+_PROXY = os.environ.get("YTDL_PROXY") or None
+
+
+def _ydl_base_opts(outtmpl: str) -> dict[str, Any]:
+    """Common yt-dlp options shared by all download attempts."""
+    opts: dict[str, Any] = {
+        "format":        "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "outtmpl":       outtmpl,
+        "quiet":         True,
+        "no_warnings":   True,
+        "noplaylist":    True,
+        "max_filesize":  MAX_FILE_MB * 1024 * 1024,
+        # Use the music.youtube.com domain — slightly less aggressive bot-detection
+        "source_address": "0.0.0.0",
+        "http_headers":  _YT_HEADERS,
+        # Extractor args to bypass some bot checks
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android"],
+                "skip": ["dash", "hls"],
+            }
+        },
+        # Retry on transient network errors
+        "retries":        5,
+        "fragment_retries": 5,
+    }
+    if _PROXY:
+        opts["proxy"] = _PROXY
+    return opts
+
+
+def _ffmpeg_available() -> bool:
+    import shutil as _shutil
+    return bool(_shutil.which("ffmpeg"))
+
+
 def download_audio(video_id: str, tmpdir: str) -> tuple[str, dict]:
     """
     Download the best available audio stream for *video_id* into *tmpdir*.
 
+    Strategy:
+      1. Try music.youtube.com URL (less bot-detection than youtube.com)
+      2. Fall back to youtube.com URL
+      3. If FFmpeg is present, remux to MP3; otherwise keep the native format
+         (m4a/webm — Telegram plays both fine as audio files)
+
     Returns (file_path, yt_dlp_info_dict).
     Raises RuntimeError on failure or when the file exceeds MAX_FILE_MB.
     """
-    url     = f"https://www.youtube.com/watch?v={video_id}"
+    # Prefer the music subdomain — fewer bot-detection challenges on servers
+    urls = [
+        f"https://music.youtube.com/watch?v={video_id}",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
-    # Options with FFmpeg MP3 conversion
-    ydl_opts: dict[str, Any] = {
-        "format":      "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl":     outtmpl,
-        "quiet":       True,
-        "no_warnings": True,
-        "noplaylist":  True,
-        "max_filesize": MAX_FILE_MB * 1024 * 1024,
-        "postprocessors": [{
+    has_ffmpeg = _ffmpeg_available()
+    logger.info("FFmpeg available: %s", has_ffmpeg)
+
+    base = _ydl_base_opts(outtmpl)
+
+    if has_ffmpeg:
+        base["postprocessors"] = [{
             "key":              "FFmpegExtractAudio",
             "preferredcodec":   "mp3",
             "preferredquality": "192",
-        }],
-    }
-
-    # Options without FFmpeg (raw audio fallback)
-    ydl_opts_raw: dict[str, Any] = {
-        "format":      "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl":     outtmpl,
-        "quiet":       True,
-        "no_warnings": True,
-        "noplaylist":  True,
-        "max_filesize": MAX_FILE_MB * 1024 * 1024,
-    }
+        }]
 
     info: dict = {}
-    path: str  = ""
+    last_error: str = ""
 
-    # --- attempt 1: with FFmpeg ---
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True) or {}
-            # After FFmpeg conversion yt-dlp renames the file to .mp3
-            mp3_path = os.path.join(tmpdir, f"{video_id}.mp3")
-            path = mp3_path if os.path.exists(mp3_path) else ydl.prepare_filename(info)
-    except yt_dlp.utils.DownloadError as exc:
-        err = str(exc).lower()
-        if "ffmpeg" in err or "postprocess" in err or "ffprobe" in err:
-            # FFmpeg not installed — retry without post-processing
-            logger.info("FFmpeg unavailable, downloading raw audio for %s", video_id)
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts_raw) as ydl:
-                    info = ydl.extract_info(url, download=True) or {}
-                    path = ydl.prepare_filename(info)
-            except yt_dlp.utils.DownloadError as exc2:
-                raise RuntimeError(str(exc2)) from exc2
-        else:
+    for url in urls:
+        try:
+            with yt_dlp.YoutubeDL(base) as ydl:
+                info = ydl.extract_info(url, download=True) or {}
+            # Success — break out of the retry loop
+            break
+        except yt_dlp.utils.DownloadError as exc:
+            last_error = str(exc)
+            err_lower  = last_error.lower()
+
+            # If the error is specifically about FFmpeg, strip the postprocessor
+            # and retry the same URL without it
+            if has_ffmpeg and ("ffmpeg" in err_lower or "ffprobe" in err_lower):
+                logger.warning("FFmpeg post-processing failed, retrying without it: %s", exc)
+                opts_no_ff = {k: v for k, v in base.items() if k != "postprocessors"}
+                try:
+                    with yt_dlp.YoutubeDL(opts_no_ff) as ydl:
+                        info = ydl.extract_info(url, download=True) or {}
+                    break
+                except yt_dlp.utils.DownloadError as exc2:
+                    last_error = str(exc2)
+                    continue
+
+            # Bot-detection / sign-in errors — try the next URL
+            if any(kw in err_lower for kw in ("sign in", "bot", "confirm", "429", "403")):
+                logger.warning("Bot-detection hit for %s, trying next URL: %s", url, exc)
+                continue
+
+            # Any other download error — give up immediately
+            raise RuntimeError(last_error) from exc
+        except Exception as exc:
             raise RuntimeError(str(exc)) from exc
-    except Exception as exc:
-        raise RuntimeError(str(exc)) from exc
+    else:
+        # All URLs exhausted
+        raise RuntimeError(
+            "YouTube is blocking downloads from this server. "
+            f"Last error: {last_error}"
+        )
 
-    # Fallback: scan tmpdir for any completed file
+    # Locate the downloaded file
+    path = ""
+    if has_ffmpeg:
+        mp3 = os.path.join(tmpdir, f"{video_id}.mp3")
+        path = mp3 if os.path.exists(mp3) else ""
+
+    if not path:
+        try:
+            path = yt_dlp.YoutubeDL(base).prepare_filename(info)
+        except Exception:
+            path = ""
+
     if not path or not os.path.exists(path):
-        candidates = [
-            f for f in os.listdir(tmpdir)
-            if not f.endswith(".part") and not f.endswith(".ytdl")
-        ]
+        candidates = sorted(
+            [f for f in os.listdir(tmpdir)
+             if not f.endswith(".part") and not f.endswith(".ytdl")],
+            key=lambda f: os.path.getsize(os.path.join(tmpdir, f)),
+            reverse=True,
+        )
         if not candidates:
             raise RuntimeError("Download produced no output file.")
         path = os.path.join(tmpdir, candidates[0])
@@ -164,6 +237,7 @@ def download_audio(video_id: str, tmpdir: str) -> tuple[str, dict]:
             f"Track is {size_mb:.0f} MB — too large for Telegram (limit {MAX_FILE_MB} MB)."
         )
 
+    logger.info("Downloaded %s → %s (%.1f MB)", video_id, path, size_mb)
     return path, info
 
 
@@ -403,7 +477,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not chat_id:
             return
 
-        tmpdir = tempfile.mkdtemp(prefix="ytbot_")
+        tmpdir = tempfile.mkdtemp(prefix="ytbot_", dir="/tmp")
         try:
             path, dl_info = await _run_blocking(download_audio, video_id, tmpdir)
 
