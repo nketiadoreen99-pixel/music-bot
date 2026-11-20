@@ -1,6 +1,8 @@
 # Never commit cookies or secrets
 cookies.txt
 *.cookies
+*_cookies.txt
+*cookies*.txt
 .env
 
 # Python

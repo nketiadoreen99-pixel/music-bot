@@ -1,20 +1,36 @@
-# Telegram Music Bot (SoundCloud)
+# Telegram Music Bot — Multi-Platform Search
 
-Searches SoundCloud via yt-dlp and sends the audio file directly to the user's Telegram chat.
+Searches **SoundCloud**, **Audiomack**, **YouTube Music**, and **Boomplay** in
+parallel, ranks results by relevance, and sends the audio file directly to
+the user's Telegram chat.
 
 ## Features
 
-- Search by any text — song name, artist, or both
-- Paste a SoundCloud track URL to download it directly
-- Results shown as an inline keyboard — tap any result to see details and download
-- Audio sent as a Telegram audio file (MP3, saved in the user's chat)
-- Cleans up `/tmp` after every send
-- FFmpeg converts to MP3 at 192 kbps; works without FFmpeg too (sends native format)
+- **Multi-platform search** — all four sources searched in parallel
+- **Smart ranking** — exact title/artist matches, word-level matching,
+  recency bonus, remix penalty, popularity bonus
+- **Source-aware results** — every result shows which platform it came from
+- **Download** — audio sent as a Telegram file (MP3 when FFmpeg is available)
+- **Listen** — URL button opens the track on its source platform
+- **More Results** — pagination through all combined results
+- **Another Source** — filter results to a specific platform
+- **Graceful degradation** — one unavailable platform never crashes the bot
+- **Search cache** — 5-minute cache avoids duplicate searches
+- **Cookie support** — `YOUTUBE_COOKIES` env var for YouTube Music downloads
+
+## Platform status
+
+| Platform | Search | Download | Notes |
+|---|---|---|---|
+| SoundCloud | ✅ yt-dlp scsearch | ✅ yt-dlp | Best results, always downloadable |
+| YouTube Music | ✅ ytmusicapi | ✅ with cookies | `can_download=False` without cookies |
+| Audiomack | ⚠️ API/scrape | ✅ yt-dlp | API moved; scraping may fail |
+| Boomplay | ⚠️ API/scrape | ❌ listen only | 403 blocks scrapers; returns listening links |
 
 ## Requirements
 
-- Python 3.10 or newer
-- FFmpeg on PATH (recommended — installed automatically on Railway via `nixpacks.toml`)
+- Python 3.10+
+- FFmpeg (recommended for MP3 conversion; bot works without it)
 
 ## Setup
 
@@ -41,12 +57,21 @@ Searches SoundCloud via yt-dlp and sends the audio file directly to the user's T
 |---|---|
 | Search | Type any song name or `Song - Artist` |
 | Step-by-step | `/search` then type when prompted |
-| Direct URL | Paste a `soundcloud.com` track URL |
-| Download | Tap a result → tap **Download & Send Audio** |
-| Cancel | `/cancel` during a search |
+| Direct URL | Paste a SoundCloud/Audiomack/YouTube URL |
+| View details | Tap any result button |
+| Download | Tap **Download** (only when the source permits) |
+| Listen | Tap **Listen** (opens the source page) |
+| More | Tap **More Results** for next page |
+| Another source | Tap **Another Source** to filter by platform |
+| Cancel | `/cancel` |
 
 ## Deploy on Railway
 
-Push this repo to GitHub, connect it to Railway, and set `TELEGRAM_BOT_TOKEN`
-as an environment variable. `nixpacks.toml` installs FFmpeg automatically.
-The bot uses long polling — no webhook or public URL needed.
+1. Push this repo to GitHub
+2. Connect it to Railway
+3. Set environment variables:
+   - `TELEGRAM_BOT_TOKEN` (or `BOT_TOKEN`) — your BotFather token
+   - `YOUTUBE_COOKIES` (optional) — Netscape cookies.txt contents for YouTube Music downloads
+4. Start command: `python music_bot.py` (already in `railway.json`)
+
+No API keys are hardcoded. Cookies are read from env vars only.

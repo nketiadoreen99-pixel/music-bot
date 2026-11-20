@@ -1,12 +1,14 @@
 """
-Telegram Music Bot
-- Searches SoundCloud via yt-dlp scsearch
-- Downloads audio via yt-dlp (bestaudio/best → FFmpegExtractAudio → mp3)
-- Sends the mp3 to the user then deletes the file from /tmp
+Telegram Music Bot — Multi-Platform Search
+- Searches SoundCloud, Audiomack, YouTube Music, and Boomplay in parallel
+- Ranks results by relevance (exact match, recency, official releases)
+- Downloads audio via yt-dlp where permitted, sends listening links otherwise
+- Sends the audio file to the user then deletes it from /tmp
 
-Design rule: every callback always operates on the SAME message (cq.message).
-We never reply_photo or send new messages from a callback, because that breaks
-subsequent callbacks whose cq.message would be the wrong object.
+Design rules:
+  • Every callback edits cq.message in-place (never sends new messages).
+  • One unavailable platform never crashes the bot.
+  • No API keys or cookies are hardcoded — all from env vars.
 """
 
 import asyncio
@@ -15,10 +17,12 @@ import html
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -37,6 +41,19 @@ from telegram.ext import (
     filters,
 )
 
+# ── Optional platform imports (each is skipped gracefully if missing) ────────
+
+try:
+    import httpx  # for Audiomack / Boomplay API calls
+except ImportError:
+    httpx = None
+
+try:
+    from ytmusicapi import YTMusic as _YTMusic
+    _ytm = _YTMusic()
+except Exception:
+    _ytm = None
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -47,7 +64,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Silence noisy libraries that would leak the bot token or flood the log.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram.vendor.ptb_urllib3").setLevel(logging.WARNING)
@@ -56,10 +72,8 @@ logging.getLogger("telegram.vendor.ptb_urllib3").setLevel(logging.WARNING)
 # ── yt-dlp logger adapter ─────────────────────────────────────────────────────
 
 class _YtdlLogger:
-    """Routes yt-dlp internal messages into Python's logging system."""
-
     def debug(self, msg: str) -> None:
-        if "[download]" in msg:   # skip noisy progress lines
+        if "[download]" in msg:
             return
         logger.debug("yt-dlp: %s", msg)
 
@@ -77,32 +91,32 @@ _YTDL_LOGGER = _YtdlLogger()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MAX_RESULTS = 5
-MAX_FILE_MB = 48    # Telegram bot file upload limit is 50 MB
-ASK_SONG    = 0     # ConversationHandler state
+PAGE_SIZE   = 5        # results shown per page
+MAX_FILE_MB = 48       # Telegram bot file upload limit is 50 MB
+ASK_SONG    = 0        # ConversationHandler state
+CACHE_TTL   = 300      # search cache lives 5 minutes
 
-# Cookie file path — set in main() if the YOUTUBE_COOKIES env var is present.
-# Lets yt-dlp send authenticated cookies to bypass "Sign in to confirm you're
-# not a bot" blocks.  Empty string means no cookies (skipped entirely).
+SOURCES = ["SoundCloud", "Audiomack", "YouTube Music", "Boomplay"]
+
 _COOKIEFILE = ""
 
 # ── Error messages shown to users (include code for log matching) ─────────────
 
 _ERR: dict[str, str] = {
     "DOWNLOAD_FAILED": (
-        "❌ Download failed. The track may be unavailable or region-locked.\n"
-        "<code>[DOWNLOAD_FAILED]</code>"
+        "❌ Download failed. The track may be unavailable, region-locked, or "
+        "the source does not permit downloads.\n<code>[DOWNLOAD_FAILED]</code>"
     ),
     "FILE_TOO_LARGE": (
         f"❌ That track exceeds Telegram's {MAX_FILE_MB} MB upload limit.\n"
-        "<code>[FILE_TOO_LARGE]</code>"
+        f"<code>[FILE_TOO_LARGE]</code>"
     ),
     "SEND_FAILED": (
         "❌ The file downloaded but Telegram refused the upload.\n"
         "<code>[SEND_FAILED]</code>"
     ),
     "SEARCH_EMPTY": (
-        "No results found. Try different words.\n"
+        "No results found on any source. Try different words.\n"
         "<code>[SEARCH_EMPTY]</code>"
     ),
     "INTERNAL_ERROR": (
@@ -125,21 +139,22 @@ def _ffmpeg_available() -> bool:
     return bool(shutil.which("ffmpeg"))
 
 
-def _is_sc_url(text: str) -> bool:
-    """True when *text* is a soundcloud.com track URL."""
+def _is_music_url(text: str) -> bool:
+    """True when *text* is a URL from any supported music platform."""
     try:
         p = urlparse(text.strip())
-        return p.scheme in ("http", "https") and "soundcloud.com" in p.netloc
+        if p.scheme not in ("http", "https"):
+            return False
+        host = p.netloc.lower()
+        return any(d in host for d in (
+            "soundcloud.com", "audiomack.com", "music.youtube.com",
+            "youtube.com", "youtu.be", "boomplay.com",
+        ))
     except Exception:
         return False
 
 
 def _setup_cookies() -> str:
-    """
-    Read Netscape cookies from the YOUTUBE_COOKIES env var and write them to
-    /tmp/cookies.txt at startup.  Returns the file path, or "" if the env var
-    is unset or writing fails.  Cookies are never committed to git.
-    """
     raw = os.environ.get("YOUTUBE_COOKIES")
     if not raw:
         return ""
@@ -154,46 +169,466 @@ def _setup_cookies() -> str:
         return ""
 
 
-# ── SoundCloud search ─────────────────────────────────────────────────────────
+# ── Ranking ──────────────────────────────────────────────────────────────────
 
-def sc_search(query: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
-    """
-    Search SoundCloud with yt-dlp scsearch.
-    Returns [] on failure (logs full traceback).
-    """
+_REMIX_WORDS = (
+    "remix", "cover", "edit", "bootleg", "instrumental",
+    "acoustic", "karaoke", "slowed", "reverb", "nightcore",
+)
+
+
+def _rank_score(track: dict, query: str) -> float:
+    """Score a track's relevance to *query*.  Higher = better."""
+    q = query.lower().strip()
+    title = (track.get("title") or "").lower()
+    artist = (track.get("artist") or "").lower()
+    score = 0.0
+
+    # Exact title match
+    if title == q:
+        score += 100
+    elif title.startswith(q):
+        score += 60
+    elif q in title:
+        score += 35
+
+    # Exact artist match
+    if artist and artist == q:
+        score += 60
+    elif q in artist:
+        score += 30
+
+    # "Song - Artist" format: bonus when both parts match
+    if " - " in q:
+        parts = q.split(" - ", 1)
+        song_part, artist_part = parts[0].strip(), parts[1].strip()
+        if song_part in title:
+            score += 30
+        if artist_part in artist:
+            score += 40
+
+    # Word-level matching (handles "Artist Song" queries without hyphens)
+    q_words = {w for w in q.split() if len(w) > 2}
+    if q_words:
+        for w in q_words:
+            if w in title:
+                score += 15
+            if w in artist:
+                score += 15
+
+    # Penalise remixes/covers when the user didn't ask for one
+    if any(w in title for w in _REMIX_WORDS) and not any(w in q for w in _REMIX_WORDS):
+        score -= 35
+
+    # Popularity bonus (views)
+    views_str = str(track.get("views") or "")
+    if views_str:
+        try:
+            num = float(re.sub(r"[^\d.]", "", views_str))
+            if "B" in views_str:
+                num *= 1000
+            score += min(num, 20)
+        except (ValueError, TypeError):
+            pass
+
+    # Recency bonus
+    release = str(track.get("release_date") or "")
+    if release:
+        try:
+            year = int(release[:4])
+            if year >= 2024:
+                score += 15
+            elif year >= 2022:
+                score += 10
+            elif year >= 2020:
+                score += 5
+        except (ValueError, TypeError):
+            pass
+
+    # Penalise very long tracks (likely DJ mixes)
+    dur = track.get("duration") or 0
+    if dur and dur > 600:
+        score -= 15
+
+    return score
+
+
+# ── Platform: SoundCloud ─────────────────────────────────────────────────────
+
+def search_soundcloud(query: str, limit: int = 5) -> list[dict]:
+    """Search SoundCloud via yt-dlp scsearch.  Returns normalised track dicts."""
     search_url = f"scsearch{limit}:{query}"
-    logger.info("SEARCH_START query=%r source=SoundCloud url=%r", query, search_url)
-
+    logger.info("SEARCH_START source=SoundCloud query=%r", query)
     opts: dict[str, Any] = {
-        "quiet":        False,
-        "no_warnings":  False,
-        "extract_flat": True,
-        "noplaylist":   False,
-        "logger":       _YTDL_LOGGER,
+        "quiet": True, "no_warnings": True,
+        "extract_flat": True, "noplaylist": False,
+        "logger": _YTDL_LOGGER,
     }
-
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(search_url, download=False) or {}
+        tracks = []
+        for e in (info.get("entries") or []):
+            if not e or not e.get("id"):
+                continue
+            thumbs = e.get("thumbnails") or []
+            tracks.append({
+                "title": e.get("title", ""),
+                "artist": e.get("uploader", ""),
+                "album": "", 
+                "duration": e.get("duration"),
+                "thumbnail": e.get("thumbnail") or (thumbs[-1]["url"] if thumbs else ""),
+                "url": e.get("webpage_url") or e.get("url", ""),
+                "source": "SoundCloud",
+                "can_download": True,
+                "release_date": "",
+                "download_url": e.get("webpage_url") or e.get("url", ""),
+                "views": "",
+            })
+        logger.info("SEARCH_DONE source=SoundCloud results=%d query=%r", len(tracks), query)
+        return tracks
+    except Exception:
+        logger.exception("SEARCH_FAILED source=SoundCloud query=%r", query)
+        return []
 
-        entries = [e for e in (info.get("entries") or []) if e and e.get("id")]
-        logger.info("SEARCH_DONE results=%d query=%r", len(entries), query)
-        return entries
+
+# ── Platform: Audiomack ──────────────────────────────────────────────────────
+
+def search_audiomack(query: str, limit: int = 5) -> list[dict]:
+    """Search Audiomack.  Tries the API, then falls back to scraping the search page."""
+    if httpx is None:
+        logger.warning("SEARCH_SKIP source=Audiomack reason=httpx_not_installed")
+        return []
+    logger.info("SEARCH_START source=Audiomack query=%r", query)
+    tracks: list[dict] = []
+    try:
+        # ── Attempt 1: public API (may redirect / require auth) ──────────────
+        try:
+            resp = httpx.get(
+                "https://api.audiomack.com/v2/search",
+                params={"q": query, "limit": limit},
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                timeout=12,
+                follow_redirects=True,
+            )
+            if resp.status_code == 200:
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct:
+                    data = resp.json()
+                    raw = data.get("results") or data.get("data") or []
+                    for r in raw:
+                        if not isinstance(r, dict):
+                            continue
+                        url = r.get("url") or r.get("permalink") or ""
+                        if not url and r.get("slug"):
+                            up = r.get("uploader") or {}
+                            up_slug = up.get("slug", "") if isinstance(up, dict) else r.get("uploader_slug", "")
+                            url = f"https://audiomack.com/{up_slug}/song/{r.get('slug', '')}"
+                        if not url:
+                            continue
+                        tracks.append({
+                            "title": r.get("title", ""),
+                            "artist": (r.get("artist") or
+                                       (r.get("uploader", {}).get("name", "") if isinstance(r.get("uploader"), dict) else "")),
+                            "album": "",
+                            "duration": r.get("duration"),
+                            "thumbnail": r.get("image") or r.get("artwork") or "",
+                            "url": url,
+                            "source": "Audiomack",
+                            "can_download": True,
+                            "release_date": (r.get("upload_date") or "")[:10],
+                            "download_url": url,
+                            "views": str(r.get("plays", "")) if r.get("plays") else "",
+                        })
+            if tracks:
+                logger.info("SEARCH_DONE source=Audiomack results=%d query=%r (via API)", len(tracks), query)
+                return tracks[:limit]
+        except Exception:
+            pass  # fall through to scraping
+
+        # ── Attempt 2: scrape the search page ────────────────────────────────
+        resp = httpx.get(
+            "https://audiomack.com/search",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=12,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        html = resp.text
+
+        # Track links look like: /artist-slug/song/song-slug
+        link_pattern = re.compile(r'href="(/[^"]+/song/[^"]+)"')
+        seen: set[str] = set()
+        for m in link_pattern.finditer(html):
+            path = m.group(1)
+            if path in seen:
+                continue
+            seen.add(path)
+            parts = path.strip("/").split("/song/")
+            if len(parts) != 2:
+                continue
+            artist_slug, song_slug = parts[0], parts[1]
+            url = f"https://audiomack.com{path}"
+            tracks.append({
+                "title": song_slug.replace("-", " ").title(),
+                "artist": artist_slug.replace("-", " ").title(),
+                "album": "",
+                "duration": None,
+                "thumbnail": "",
+                "url": url,
+                "source": "Audiomack",
+                "can_download": True,
+                "release_date": "",
+                "download_url": url,
+                "views": "",
+            })
+            if len(tracks) >= limit:
+                break
+
+        logger.info("SEARCH_DONE source=Audiomack results=%d query=%r (via scrape)", len(tracks), query)
+        return tracks[:limit]
 
     except Exception:
-        logger.exception("SEARCH_FAILED query=%r", query)
+        logger.exception("SEARCH_FAILED source=Audiomack query=%r", query)
         return []
+
+
+# ── Platform: YouTube Music ───────────────────────────────────────────────────
+
+def search_ytmusic(query: str, limit: int = 5) -> list[dict]:
+    """Search YouTube Music via ytmusicapi.  Returns normalised track dicts."""
+    if _ytm is None:
+        logger.warning("SEARCH_SKIP source=YouTubeMusic reason=ytmusicapi_not_installed")
+        return []
+    logger.info("SEARCH_START source=YouTubeMusic query=%r", query)
+    try:
+        results = _ytm.search(query, filter="songs", limit=limit)
+        tracks = []
+        for r in results:
+            vid = r.get("videoId")
+            if not vid:
+                continue
+            artists = r.get("artists") or []
+            artist_names = ", ".join(a.get("name", "") for a in artists if a.get("name"))
+            album_info = r.get("album") or {}
+            thumbs = r.get("thumbnails") or []
+            watch_url = f"https://music.youtube.com/watch?v={vid}"
+            tracks.append({
+                "title": r.get("title", ""),
+                "artist": artist_names,
+                "album": album_info.get("name", ""),
+                "duration": r.get("duration_seconds"),
+                "thumbnail": thumbs[-1].get("url", "") if thumbs else "",
+                "url": watch_url,
+                "source": "YouTube Music",
+                "can_download": bool(_COOKIEFILE),  # only with cookies
+                "release_date": str(r.get("year") or ""),
+                "download_url": watch_url,
+                "views": r.get("views", ""),
+            })
+        logger.info("SEARCH_DONE source=YouTubeMusic results=%d query=%r", len(tracks), query)
+        return tracks
+    except Exception:
+        logger.exception("SEARCH_FAILED source=YouTubeMusic query=%r", query)
+        return []
+
+
+# ── Platform: Boomplay ──────────────────────────────────────────────────────
+
+def search_boomplay(query: str, limit: int = 5) -> list[dict]:
+    """Search Boomplay.  Returns listening links only (no download)."""
+    if httpx is None:
+        logger.warning("SEARCH_SKIP source=Boomplay reason=httpx_not_installed")
+        return []
+    logger.info("SEARCH_START source=Boomplay query=%r", query)
+    tracks: list[dict] = []
+    try:
+        # ── Attempt 1: try known API endpoints ───────────────────────────────
+        api_urls = [
+            "https://www.boomplay.com/api/v3.0/search/song",
+            "https://www.boomplay.com/api/v3.0/search/music",
+            "https://m.boomplay.com/api/v3.0/search/song",
+        ]
+        for api_url in api_urls:
+            try:
+                resp = httpx.get(
+                    api_url,
+                    params={"keyword": query, "page": 1, "size": limit},
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "Accept": "application/json",
+                    },
+                    timeout=12,
+                )
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                raw = (
+                    (data.get("data") or {}).get("list")
+                    if isinstance(data.get("data"), dict) else data.get("data")
+                ) or []
+                for r in raw:
+                    if not isinstance(r, dict):
+                        continue
+                    tid = r.get("id") or r.get("songId") or ""
+                    if not tid:
+                        continue
+                    tracks.append({
+                        "title": r.get("name") or r.get("title", ""),
+                        "artist": r.get("singerName") or r.get("artist", ""),
+                        "album": r.get("albumName", ""),
+                        "duration": r.get("duration", 0),
+                        "thumbnail": r.get("cover") or r.get("pic") or r.get("image", ""),
+                        "url": f"https://www.boomplay.com/music/{tid}",
+                        "source": "Boomplay",
+                        "can_download": False,
+                        "release_date": str(r.get("releaseDate") or "")[:10],
+                        "download_url": "",
+                        "views": str(r.get("playCount", "")) if r.get("playCount") else "",
+                    })
+                if tracks:
+                    logger.info("SEARCH_DONE source=Boomplay results=%d query=%r (via API)", len(tracks), query)
+                    return tracks[:limit]
+            except Exception:
+                continue
+
+        # ── Attempt 2: scrape the search page ────────────────────────────────
+        resp = httpx.get(
+            f"https://www.boomplay.com/search/{query}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=12,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        html = resp.text
+
+        # Look for music links: /music/NUMBER
+        link_pattern = re.compile(r'href="(/music/(\d+)[^"]*)"')
+        # Also try to grab titles from nearby elements
+        title_pattern = re.compile(r'<(?:a|span|div)[^>]*>([^<]{2,80})</(?:a|span|div)>')
+        seen: set[str] = set()
+        for m in link_pattern.finditer(html):
+            path, tid = m.group(1), m.group(2)
+            if tid in seen:
+                continue
+            seen.add(tid)
+            tracks.append({
+                "title": "",   # title extraction from HTML is unreliable; leave blank
+                "artist": "",
+                "album": "",
+                "duration": 0,
+                "thumbnail": "",
+                "url": f"https://www.boomplay.com{path}",
+                "source": "Boomplay",
+                "can_download": False,
+                "release_date": "",
+                "download_url": "",
+                "views": "",
+            })
+            if len(tracks) >= limit:
+                break
+
+        # If we only got URLs without titles, try to extract titles from the page
+        if tracks and not tracks[0].get("title"):
+            # Try to find title/artist pairs near the music links
+            for t in tracks:
+                tid = t["url"].split("/music/")[-1].split("?")[0].split("/")[0]
+                # Look for the title near this ID in the HTML
+                title_match = re.search(
+                    rf'{re.escape(tid)}[^>]*>.*?<[^>]*title[^>]*>([^<]+)<',
+                    html, re.DOTALL,
+                )
+                if title_match:
+                    t["title"] = title_match.group(1).strip()
+
+        # Filter out tracks with no title
+        tracks = [t for t in tracks if t.get("title")]
+
+        logger.info("SEARCH_DONE source=Boomplay results=%d query=%r (via scrape)", len(tracks), query)
+        return tracks[:limit]
+
+    except Exception:
+        logger.exception("SEARCH_FAILED source=Boomplay query=%r", query)
+        return []
+
+
+# ── Multi-source search orchestrator ──────────────────────────────────────────
+
+async def multi_search(
+    query: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> list[dict]:
+    """
+    Search all available platforms in parallel, merge, rank, deduplicate,
+    and cache the results.
+    """
+    cache_key = query.lower().strip()
+    cache: dict = context.bot_data.setdefault("_search_cache", {})
+    if cache_key in cache:
+        ts, results = cache[cache_key]
+        if time.time() - ts < CACHE_TTL:
+            logger.info("SEARCH_CACHE_HIT query=%r", query)
+            return results
+
+    logger.info("MULTI_SEARCH_START query=%r", query)
+
+    search_fns = [
+        ("SoundCloud",   search_soundcloud),
+        ("Audiomack",    search_audiomack),
+        ("YouTube Music", search_ytmusic),
+        ("Boomplay",     search_boomplay),
+    ]
+
+    coros = [_run_blocking(fn, query, 5) for _, fn in search_fns]
+    results = await asyncio.gather(*coros, return_exceptions=True)
+
+    all_tracks: list[dict] = []
+    for (name, _), result in zip(search_fns, results):
+        if isinstance(result, Exception):
+            logger.warning("SEARCH_SOURCE_FAILED source=%s error=%s", name, result)
+            continue
+        if result:
+            logger.info("SEARCH_SOURCE_OK source=%s results=%d", name, len(result))
+            all_tracks.extend(result)
+        else:
+            logger.info("SEARCH_SOURCE_EMPTY source=%s", name)
+
+    # Rank by relevance
+    ranked = sorted(all_tracks, key=lambda t: _rank_score(t, query), reverse=True)
+
+    # Deduplicate by (title, artist) — keep highest-ranked
+    seen: set = set()
+    deduped: list[dict] = []
+    for t in ranked:
+        key = (
+            (t.get("title") or "").lower().strip()[:60],
+            (t.get("artist") or "").lower().strip()[:40],
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+
+    logger.info("MULTI_SEARCH_DONE query=%r total=%d ranked=%d", query, len(all_tracks), len(deduped))
+
+    # Cache
+    cache[cache_key] = (time.time(), deduped)
+
+    return deduped
 
 
 # ── yt-dlp audio download ─────────────────────────────────────────────────────
 
-def download_audio(sc_url: str, tmpdir: str) -> tuple[str, dict]:
+def download_audio(url: str, tmpdir: str) -> tuple[str, dict]:
     """
-    Download *sc_url* into *tmpdir*, remux to MP3 if FFmpeg is available.
-    Returns (absolute_file_path, yt_dlp_info_dict).
-    Raises RuntimeError("DOWNLOAD_FAILED" | "FILE_TOO_LARGE") on failure.
+    Download *url* into *tmpdir*, remux to MP3 if FFmpeg is available.
+    Returns (file_path, info_dict).
+    Raises RuntimeError("DOWNLOAD_FAILED" | "FILE_TOO_LARGE").
     """
-    logger.info("DOWNLOAD_START url=%r tmpdir=%r", sc_url, tmpdir)
+    logger.info("DOWNLOAD_START url=%r tmpdir=%r", url, tmpdir)
 
     has_ffmpeg = _ffmpeg_available()
     logger.info("DOWNLOAD ffmpeg=%s", has_ffmpeg)
@@ -220,7 +655,6 @@ def download_audio(sc_url: str, tmpdir: str) -> tuple[str, dict]:
     else:
         logger.warning("DOWNLOAD ffmpeg_missing — native format will be sent")
 
-    # Attach cookies (if the YOUTUBE_COOKIES env var was set at startup)
     if _COOKIEFILE and os.path.exists(_COOKIEFILE):
         opts["cookiefile"] = _COOKIEFILE
         logger.info("DOWNLOAD using_cookies path=%r", _COOKIEFILE)
@@ -228,12 +662,12 @@ def download_audio(sc_url: str, tmpdir: str) -> tuple[str, dict]:
     info: dict = {}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(sc_url, download=True) or {}
+            info = ydl.extract_info(url, download=True) or {}
     except yt_dlp.utils.DownloadError:
-        logger.exception("DOWNLOAD_FAILED [DownloadError] url=%r", sc_url)
+        logger.exception("DOWNLOAD_FAILED [DownloadError] url=%r", url)
         raise RuntimeError("DOWNLOAD_FAILED")
     except Exception:
-        logger.exception("DOWNLOAD_FAILED [unexpected] url=%r", sc_url)
+        logger.exception("DOWNLOAD_FAILED [unexpected] url=%r", url)
         raise RuntimeError("DOWNLOAD_FAILED")
 
     # Locate the produced file
@@ -244,7 +678,6 @@ def download_audio(sc_url: str, tmpdir: str) -> tuple[str, dict]:
         mp3 = os.path.join(tmpdir, f"{track_id}.mp3")
         if os.path.exists(mp3):
             path = mp3
-            logger.info("DOWNLOAD file_found via id+ext path=%r", path)
 
     if not path and info:
         try:
@@ -253,33 +686,26 @@ def download_audio(sc_url: str, tmpdir: str) -> tuple[str, dict]:
             for candidate in [raw, os.path.splitext(raw)[0] + ".mp3"]:
                 if os.path.exists(candidate):
                     path = candidate
-                    logger.info("DOWNLOAD file_found via prepare_filename path=%r", path)
                     break
         except Exception:
-            logger.exception("DOWNLOAD prepare_filename error")
+            pass
 
     if not path or not os.path.exists(path):
         all_files = [
             f for f in os.listdir(tmpdir)
             if not f.endswith(".part") and not f.endswith(".ytdl")
         ]
-        logger.info("DOWNLOAD tmpdir_scan files=%r", all_files)
         if not all_files:
             logger.error("DOWNLOAD_FAILED no_output_file tmpdir=%r", tmpdir)
             raise RuntimeError("DOWNLOAD_FAILED")
-        # Pick the largest file (most likely the audio)
-        all_files.sort(
-            key=lambda f: os.path.getsize(os.path.join(tmpdir, f)),
-            reverse=True,
-        )
+        all_files.sort(key=lambda f: os.path.getsize(os.path.join(tmpdir, f)), reverse=True)
         path = os.path.join(tmpdir, all_files[0])
-        logger.info("DOWNLOAD file_found via scan path=%r", path)
 
     size_mb = os.path.getsize(path) / (1024 * 1024)
     logger.info("DOWNLOAD_COMPLETE path=%r size_mb=%.2f", path, size_mb)
 
     if size_mb > MAX_FILE_MB:
-        logger.error("FILE_TOO_LARGE size_mb=%.2f url=%r", size_mb, sc_url)
+        logger.error("FILE_TOO_LARGE size_mb=%.2f url=%r", size_mb, url)
         raise RuntimeError("FILE_TOO_LARGE")
 
     return path, info
@@ -287,55 +713,86 @@ def download_audio(sc_url: str, tmpdir: str) -> tuple[str, dict]:
 
 # ── UI builders ───────────────────────────────────────────────────────────────
 
-def build_results_message(tracks: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
-    """Results list as a single editable text message + inline keyboard."""
-    lines: list[str] = [
-        "<b>🎵 Search results — SoundCloud</b>",
-        "<i>Tap a track to see details and download it.</i>\n",
+def build_results_page(
+    tracks: list[dict],
+    page: int,
+    query: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build one page of search results as a single editable text message."""
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_tracks = tracks[start:end]
+    total_pages = max(1, (len(tracks) + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    lines = [
+        f'<b>🎵 Search results for "{html.escape(query)}"</b>',
+        f"<i>{len(tracks)} track(s) from multiple sources · page {page}/{total_pages}</i>\n",
     ]
     buttons: list[list[InlineKeyboardButton]] = []
 
-    for i, track in enumerate(tracks, start=1):
-        title    = html.escape(track.get("title")    or "Unknown")
-        uploader = html.escape(track.get("uploader") or "Unknown")
-        dur      = fmt_duration(track.get("duration"))
+    for i, track in enumerate(page_tracks, start=start):
+        title   = html.escape(track.get("title", "Unknown"))
+        artist  = html.escape(track.get("artist", "Unknown"))
+        source  = track.get("source", "?")
+        dur     = fmt_duration(track.get("duration"))
 
-        line = f"{i}. <b>{title}</b> — {uploader}"
+        line = f"{i + 1}. <b>{title}</b> — {artist} [{source}]"
         if dur:
             line += f"  ·  {dur}"
         lines.append(line)
 
-        tid   = str(track["id"])
-        # Button label must fit in 64 bytes for callback_data safety
-        label = f"{i}. {track.get('title','')[:26]} — {track.get('uploader','')[:16]}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"info:{tid}")])
+        label = f"{i + 1}. {track.get('title','')[:24]} — {track.get('artist','')[:14]}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"info:{i}")])
 
+    # Navigation row
+    nav: list[InlineKeyboardButton] = []
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("🔎 More Results", callback_data=f"more:{page + 1}"))
+    nav.append(InlineKeyboardButton("🔄 Another Source", callback_data="nextsrc"))
+    buttons.append(nav)
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
-def build_track_detail(track: dict) -> tuple[str, InlineKeyboardMarkup]:
-    """Detail card for a single track — plain text only, no photo preview."""
-    title    = html.escape(track.get("title")    or "Unknown")
-    uploader = html.escape(track.get("uploader") or "Unknown")
+def build_track_detail(track: dict, index: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the detail card for a single track with source info and buttons."""
+    title    = html.escape(track.get("title", "Unknown"))
+    artist   = html.escape(track.get("artist", "Unknown"))
+    source   = track.get("source", "Unknown")
+    release  = str(track.get("release_date") or "")
     dur      = fmt_duration(track.get("duration"))
-    sc_url   = track.get("webpage_url") or track.get("url") or ""
+    url      = track.get("url", "")
+    can_dl   = track.get("can_download", False)
 
-    lines: list[str] = [
+    lines = [
         f"🎵 <b>{title}</b>",
-        f"👤 {uploader}",
+        f"👤 Artist: {artist}",
     ]
+    if release:
+        year = release[:4] if release else ""
+        if year and year != "None":
+            lines.append(f"📅 Release: {html.escape(year)}")
     if dur:
-        lines.append(f"⏱ {dur}")
-    if sc_url:
-        lines.append(f'\n🔗 <a href="{html.escape(sc_url)}">Open on SoundCloud</a>')
+        lines.append(f"⏱ Duration: {dur}")
+    lines.append(f"🎧 Source: {source}")
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬇️ Download & Send Audio", callback_data=f"dl:{track['id']}")],
-        [InlineKeyboardButton("🔙 Back to results",       callback_data="back")],
-        [InlineKeyboardButton("❌ Cancel",                callback_data="cancel")],
-    ])
-    return "\n".join(lines), keyboard
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    # Download row — only when the source permits it
+    if can_dl and track.get("download_url"):
+        buttons.append([InlineKeyboardButton("⬇️ Download", callback_data=f"dl:{index}")])
+
+    # Listen (URL button) + Back row
+    action_row: list[InlineKeyboardButton] = []
+    if url:
+        action_row.append(InlineKeyboardButton("▶️ Listen", url=url))
+    action_row.append(InlineKeyboardButton("🔙 Back", callback_data="back"))
+    buttons.append(action_row)
+
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -344,11 +801,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
+    available = []
+    if True:                       available.append("SoundCloud")
+    if httpx is not None:           available.append("Audiomack")
+    if _ytm is not None:            available.append("YouTube Music")
+    if httpx is not None:           available.append("Boomplay")
     await msg.reply_text(
-        "🎵 <b>Music Bot — SoundCloud</b>\n\n"
-        "Search SoundCloud and get the audio file sent straight to you.\n\n"
+        "🎵 <b>Music Bot — Multi-Platform Search</b>\n\n"
+        f"Sources: {', '.join(available)}\n\n"
         "• Type any song name or <code>Song - Artist</code>\n"
-        "• Paste a SoundCloud track URL to download directly\n"
+        "• Paste a music URL (SoundCloud, Audiomack, YouTube) to download directly\n"
         "• /search — step-by-step search prompt\n"
         "• /help — show this message again",
         parse_mode=ParseMode.HTML,
@@ -405,20 +867,20 @@ async def _do_search(
 
     logger.info("QUERY_RECEIVED chat_id=%s query=%r", msg.chat_id, query)
 
-    # Direct SoundCloud URL — skip search
-    if _is_sc_url(query):
+    # Direct music URL — skip search, download directly
+    if _is_music_url(query):
         logger.info("DIRECT_URL url=%r", query)
         status = await msg.reply_text("⬇️ Downloading — please wait…")
         await _download_and_send(
-            sc_url=query,
+            url=query,
             chat_id=msg.chat_id,
             status_msg=status,
             context=context,
         )
         return
 
-    status = await msg.reply_text("🔍 Searching SoundCloud…")
-    tracks = await _run_blocking(sc_search, query)
+    status = await msg.reply_text("🔍 Searching SoundCloud, Audiomack, YouTube Music, Boomplay…")
+    tracks = await multi_search(query, context)
 
     if not tracks:
         logger.warning("SEARCH_EMPTY query=%r", query)
@@ -429,102 +891,141 @@ async def _do_search(
         )
         return
 
-    context.chat_data["last_tracks"] = tracks
-    context.chat_data["last_query"]  = query
+    # Cache all results + reset pagination state
+    context.chat_data["all_tracks"] = tracks
+    context.chat_data["last_query"] = query
+    context.chat_data["current_page"] = 1
+    context.chat_data["source_offset"] = 0
 
-    text, keyboard = build_results_message(tracks)
+    text, keyboard = build_results_page(tracks, 1, query)
     await _safe_edit(status, text, keyboard)
 
 
 # ── Callback handler ──────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Single handler for all inline keyboard callbacks.
-    IMPORTANT: every branch edits cq.message in-place (never sends new messages)
-    so subsequent button taps keep working on the same message object.
-    """
     cq = update.callback_query
     if not cq or not cq.message:
         return
 
-    # Must answer within 10 s or Telegram shows an error spinner.
     try:
         await cq.answer()
     except Exception:
         pass
 
-    data     = (cq.data or "").strip()
-    chat_id  = cq.message.chat_id
+    data    = (cq.data or "").strip()
+    chat_id = cq.message.chat_id
     logger.info("CALLBACK data=%r chat_id=%s", data, chat_id)
 
     # ── cancel ────────────────────────────────────────────────────────────────
     if data == "cancel":
         logger.info("CANCEL chat_id=%s", chat_id)
-        await _safe_edit(
-            cq.message,
-            "Cancelled. Send a song name whenever you're ready.",
-        )
+        await _safe_edit(cq.message, "Cancelled. Send a song name whenever you're ready.")
         return
 
     # ── back to results ───────────────────────────────────────────────────────
     if data == "back":
-        tracks = context.chat_data.get("last_tracks")
+        tracks = context.chat_data.get("all_tracks")
+        query  = context.chat_data.get("last_query", "")
+        page   = context.chat_data.get("current_page", 1)
         if not tracks:
-            logger.warning("BACK session_expired chat_id=%s", chat_id)
+            await _safe_edit(cq.message, "Session expired — please search again.")
+            return
+        text, keyboard = build_results_page(tracks, page, query)
+        await _safe_edit(cq.message, text, keyboard)
+        return
+
+    # ── more results (pagination) ─────────────────────────────────────────────
+    if data.startswith("more:"):
+        page_str = data[5:]
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 1
+        tracks = context.chat_data.get("all_tracks")
+        query  = context.chat_data.get("last_query", "")
+        if not tracks:
+            await _safe_edit(cq.message, "Session expired — please search again.")
+            return
+        context.chat_data["current_page"] = page
+        text, keyboard = build_results_page(tracks, page, query)
+        await _safe_edit(cq.message, text, keyboard)
+        return
+
+    # ── another source ────────────────────────────────────────────────────────
+    if data == "nextsrc":
+        tracks = context.chat_data.get("all_tracks")
+        query  = context.chat_data.get("last_query", "")
+        if not tracks:
+            await _safe_edit(cq.message, "Session expired — please search again.")
+            return
+
+        # Cycle to the next source and show only that source's results
+        offset = context.chat_data.get("source_offset", 0)
+        offset = (offset + 1) % len(SOURCES)
+        context.chat_data["source_offset"] = offset
+        target = SOURCES[offset]
+        filtered = [t for t in tracks if t.get("source") == target]
+
+        if not filtered:
             await _safe_edit(
                 cq.message,
-                "Session expired — please search again.",
+                f"No results from <b>{target}</b> for this search. "
+                f"Try /search or send a new song name.",
             )
             return
-        logger.info("BACK restoring results chat_id=%s", chat_id)
-        text, keyboard = build_results_message(tracks)
+
+        context.chat_data["current_page"] = 1
+        text, keyboard = build_results_page(filtered, 1, f"{query} ({target})")
         await _safe_edit(cq.message, text, keyboard)
         return
 
     # ── track detail ──────────────────────────────────────────────────────────
     if data.startswith("info:"):
-        track_id = data[5:]
-        tracks   = context.chat_data.get("last_tracks") or []
-        track    = next((t for t in tracks if str(t.get("id")) == track_id), None)
-
-        if not track:
-            logger.warning("TRACK_NOT_FOUND track_id=%r chat_id=%s", track_id, chat_id)
-            await _safe_edit(
-                cq.message,
-                "❌ Track not found — please search again.",
-            )
+        try:
+            index = int(data[5:])
+        except ValueError:
+            await _safe_edit(cq.message, "❌ Invalid track.")
             return
-
-        logger.info("TRACK_DETAIL track_id=%r title=%r", track_id, track.get("title"))
-        text, keyboard = build_track_detail(track)
-        # Edit the same message in-place — no new messages, no broken callbacks.
+        tracks = context.chat_data.get("all_tracks") or []
+        if index < 0 or index >= len(tracks):
+            await _safe_edit(cq.message, "❌ Track not found — please search again.")
+            return
+        track = tracks[index]
+        logger.info("TRACK_DETAIL index=%d title=%r source=%s", index, track.get("title"), track.get("source"))
+        text, keyboard = build_track_detail(track, index)
         await _safe_edit(cq.message, text, keyboard)
         return
 
     # ── download ──────────────────────────────────────────────────────────────
     if data.startswith("dl:"):
-        track_id = data[3:]
-        tracks   = context.chat_data.get("last_tracks") or []
-        track    = next((t for t in tracks if str(t.get("id")) == track_id), None)
+        try:
+            index = int(data[3:])
+        except ValueError:
+            await _safe_edit(cq.message, "❌ Invalid track.")
+            return
+        tracks = context.chat_data.get("all_tracks") or []
+        if index < 0 or index >= len(tracks):
+            await _safe_edit(cq.message, "❌ Track not found — please search again.")
+            return
+        track = tracks[index]
+        dl_url = track.get("download_url") or track.get("url") or ""
 
-        sc_url = ""
-        if track:
-            sc_url = track.get("webpage_url") or track.get("url") or ""
-        if not sc_url:
-            # Fallback: reconstruct from numeric ID
-            sc_url = f"https://soundcloud.com/tracks/{track_id}"
+        if not dl_url:
+            await _safe_edit(
+                cq.message,
+                "❌ This source does not permit direct downloads. "
+                "Use the Listen button to open it in your browser.",
+            )
+            return
 
-        logger.info("DOWNLOAD_REQUEST track_id=%r url=%r chat_id=%s",
-                    track_id, sc_url, chat_id)
+        logger.info("DOWNLOAD_REQUEST index=%d url=%r source=%s chat_id=%s",
+                     index, dl_url, track.get("source"), chat_id)
 
-        await _safe_edit(
-            cq.message,
-            "⬇️ Downloading audio — this usually takes 10–30 seconds…",
-        )
+        await _safe_edit(cq.message, "⬇️ Downloading audio — this usually takes 10–30 seconds…")
 
         await _download_and_send(
-            sc_url=sc_url,
+            url=dl_url,
             chat_id=chat_id,
             status_msg=cq.message,
             context=context,
@@ -538,39 +1039,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ── Download-and-send helper ──────────────────────────────────────────────────
 
 async def _download_and_send(
-    sc_url:     str,
+    url:        str,
     chat_id:    int,
     status_msg: Any,
     context:    ContextTypes.DEFAULT_TYPE,
     track_meta: dict | None = None,
 ) -> None:
-    """Download *sc_url*, send the audio to *chat_id*, delete the temp dir."""
+    """Download *url*, send the audio to *chat_id*, delete the temp dir."""
     tmpdir = tempfile.mkdtemp(prefix="scbot_", dir="/tmp")
     logger.info("TMPDIR_CREATED %r", tmpdir)
 
     try:
-        path, dl_info = await _run_blocking(download_audio, sc_url, tmpdir)
+        path, dl_info = await _run_blocking(download_audio, url, tmpdir)
 
         title    = dl_info.get("title")    or (track_meta or {}).get("title")    or ""
-        artist   = dl_info.get("uploader") or (track_meta or {}).get("uploader") or ""
+        artist   = dl_info.get("uploader") or (track_meta or {}).get("artist")   or \
+                   dl_info.get("artist")   or (track_meta or {}).get("artist")  or ""
         dur_secs = dl_info.get("duration") or (track_meta or {}).get("duration")
-        page_url = dl_info.get("webpage_url") or sc_url
+        page_url = dl_info.get("webpage_url") or url
+        source   = (track_meta or {}).get("source", "")
         size_mb  = os.path.getsize(path) / (1024 * 1024)
 
         logger.info(
-            "UPLOAD_START chat_id=%s title=%r artist=%r size_mb=%.2f",
-            chat_id, title, artist, size_mb,
+            "UPLOAD_START chat_id=%s title=%r artist=%r source=%s size_mb=%.2f",
+            chat_id, title, artist, source, size_mb,
         )
 
+        # Build caption in the requested format
         parts: list[str] = []
         if title:
             parts.append(f"🎵 <b>{html.escape(title)}</b>")
         if artist:
-            parts.append(f"👤 {html.escape(artist)}")
+            parts.append(f"👤 Artist: {html.escape(artist)}")
+        release = (track_meta or {}).get("release_date", "")
+        if release and str(release)[:4] not in ("", "None"):
+            parts.append(f"📅 Release: {html.escape(str(release)[:4])}")
         dur_str = fmt_duration(int(dur_secs) if dur_secs else None)
         if dur_str:
-            parts.append(f"⏱ {dur_str}")
-        parts.append(f'\n🔗 <a href="{html.escape(page_url)}">Open on SoundCloud</a>')
+            parts.append(f"⏱ Duration: {dur_str}")
+        if source:
+            parts.append(f"🎧 Source: {html.escape(source)}")
+        if page_url:
+            parts.append(f'\n🔗 <a href="{html.escape(page_url)}">Open on {html.escape(source or "source")}</a>')
         caption = "\n".join(parts)
 
         try:
@@ -586,7 +1096,7 @@ async def _download_and_send(
                     duration=int(dur_secs) if dur_secs else None,
                 )
             logger.info("UPLOAD_COMPLETE chat_id=%s title=%r size_mb=%.2f",
-                        chat_id, title, size_mb)
+                         chat_id, title, size_mb)
         except Exception:
             logger.exception(
                 "SEND_FAILED chat_id=%s title=%r size_mb=%.2f",
@@ -597,16 +1107,16 @@ async def _download_and_send(
 
         await _safe_edit(
             status_msg,
-            "✅ Sent! Type another song name or paste a SoundCloud URL for more.",
+            "✅ Sent! Type another song name or paste a music URL for more.",
         )
 
     except RuntimeError as exc:
         code = str(exc)
-        logger.exception("RUNTIME_ERROR code=%r url=%r", code, sc_url)
+        logger.exception("RUNTIME_ERROR code=%r url=%r", code, url)
         await _safe_edit(status_msg, _ERR.get(code, _ERR["INTERNAL_ERROR"]))
 
     except Exception:
-        logger.exception("UNEXPECTED_ERROR url=%r", sc_url)
+        logger.exception("UNEXPECTED_ERROR url=%r", url)
         await _safe_edit(status_msg, _ERR["INTERNAL_ERROR"])
 
     finally:
@@ -621,10 +1131,6 @@ async def _safe_edit(
     text: str,
     keyboard: InlineKeyboardMarkup | None = None,
 ) -> None:
-    """
-    Edit *message* text in-place.
-    Swallows harmless Telegram errors; logs everything else.
-    """
     try:
         await message.edit_text(
             text,
@@ -635,9 +1141,8 @@ async def _safe_edit(
     except BadRequest as exc:
         err = str(exc).lower()
         if "message is not modified" in err:
-            pass   # identical content — not an error
+            pass
         elif "there is no text in the message" in err:
-            # cq.message is a photo/document — edit its caption instead
             try:
                 await message.edit_caption(
                     text,
@@ -673,7 +1178,7 @@ def _start_health_server() -> None:
             self.wfile.write(b"OK")
 
         def log_message(self, *args):
-            pass   # silence HTTP access log
+            pass
 
     server = HTTPServer(("0.0.0.0", port), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -683,7 +1188,6 @@ def _start_health_server() -> None:
 # ── Global Telegram error handler ────────────────────────────────────────────
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the full traceback and the update that triggered it."""
     update_str = "no_update"
     if isinstance(update, Update):
         try:
@@ -711,15 +1215,15 @@ def main() -> None:
             "Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN) to your BotFather token."
         )
 
-    # Startup diagnostics — printed before the logger is used by PTB so they
-    # always appear at the very top of the Railway log.
     print(f"yt-dlp version  : {yt_dlp.version.__version__}", flush=True)
     print(f"FFmpeg available: {_ffmpeg_available()}", flush=True)
-    logger.info("STARTUP yt_dlp=%s ffmpeg=%s",
-                yt_dlp.version.__version__, _ffmpeg_available())
+    print(f"YouTube Music   : {'available' if _ytm else 'unavailable (ytmusicapi not installed)'}", flush=True)
+    print(f"httpx           : {'available' if httpx else 'unavailable'}", flush=True)
+    logger.info("STARTUP yt_dlp=%s ffmpeg=%s ytmusic=%s httpx=%s",
+                yt_dlp.version.__version__, _ffmpeg_available(),
+                bool(_ytm), bool(httpx))
 
-    # Write cookies file if YOUTUBE_COOKIES env var is set (skipped if unset)
-    _COOKIEFILE = _setup_cookies()  # noqa: F811 — module-level is read by download_audio
+    _COOKIEFILE = _setup_cookies()
 
     _start_health_server()
 
