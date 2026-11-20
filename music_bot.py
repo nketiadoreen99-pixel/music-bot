@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Silence noisy libraries that would leak the bot token or flood the log.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram.vendor.ptb_urllib3").setLevel(logging.WARNING)
 
 
@@ -79,6 +80,11 @@ _YTDL_LOGGER = _YtdlLogger()
 MAX_RESULTS = 5
 MAX_FILE_MB = 48    # Telegram bot file upload limit is 50 MB
 ASK_SONG    = 0     # ConversationHandler state
+
+# Cookie file path — set in main() if the YOUTUBE_COOKIES env var is present.
+# Lets yt-dlp send authenticated cookies to bypass "Sign in to confirm you're
+# not a bot" blocks.  Empty string means no cookies (skipped entirely).
+_COOKIEFILE = ""
 
 # ── Error messages shown to users (include code for log matching) ─────────────
 
@@ -126,6 +132,26 @@ def _is_sc_url(text: str) -> bool:
         return p.scheme in ("http", "https") and "soundcloud.com" in p.netloc
     except Exception:
         return False
+
+
+def _setup_cookies() -> str:
+    """
+    Read Netscape cookies from the YOUTUBE_COOKIES env var and write them to
+    /tmp/cookies.txt at startup.  Returns the file path, or "" if the env var
+    is unset or writing fails.  Cookies are never committed to git.
+    """
+    raw = os.environ.get("YOUTUBE_COOKIES")
+    if not raw:
+        return ""
+    try:
+        path = "/tmp/cookies.txt"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raw)
+        logger.info("COOKIES_WRITTEN path=%s bytes=%d", path, len(raw))
+        return path
+    except Exception:
+        logger.exception("COOKIES_WRITE_FAILED")
+        return ""
 
 
 # ── SoundCloud search ─────────────────────────────────────────────────────────
@@ -193,6 +219,11 @@ def download_audio(sc_url: str, tmpdir: str) -> tuple[str, dict]:
         }]
     else:
         logger.warning("DOWNLOAD ffmpeg_missing — native format will be sent")
+
+    # Attach cookies (if the YOUTUBE_COOKIES env var was set at startup)
+    if _COOKIEFILE and os.path.exists(_COOKIEFILE):
+        opts["cookiefile"] = _COOKIEFILE
+        logger.info("DOWNLOAD using_cookies path=%r", _COOKIEFILE)
 
     info: dict = {}
     try:
@@ -669,6 +700,8 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global _COOKIEFILE
+
     token = (
         os.environ.get("TELEGRAM_BOT_TOKEN")
         or os.environ.get("BOT_TOKEN")
@@ -678,10 +711,15 @@ def main() -> None:
             "Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN) to your BotFather token."
         )
 
+    # Startup diagnostics — printed before the logger is used by PTB so they
+    # always appear at the very top of the Railway log.
     print(f"yt-dlp version  : {yt_dlp.version.__version__}", flush=True)
     print(f"FFmpeg available: {_ffmpeg_available()}", flush=True)
     logger.info("STARTUP yt_dlp=%s ffmpeg=%s",
                 yt_dlp.version.__version__, _ffmpeg_available())
+
+    # Write cookies file if YOUTUBE_COOKIES env var is set (skipped if unset)
+    _COOKIEFILE = _setup_cookies()  # noqa: F811 — module-level is read by download_audio
 
     _start_health_server()
 
@@ -709,4 +747,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-# redeploy
