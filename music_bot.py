@@ -1,14 +1,19 @@
 """
-Telegram Music Bot
+Telegram YouTube Music Bot
 - Searches YouTube Music (unofficial ytmusicapi)
+- Shows song details with artwork before downloading
 - Downloads audio via yt-dlp and sends the file to the user
 """
 
+import asyncio
+import functools
 import html
 import logging
 import os
 import shutil
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import yt_dlp
@@ -16,9 +21,11 @@ from ytmusicapi import YTMusic
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,11 +36,11 @@ from telegram.ext import (
     filters,
 )
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 MAX_RESULTS = 8
-MAX_FILE_MB = 48          # Telegram bot upload limit is 50 MB; stay under it
-ASK_SONG = 0              # ConversationHandler state
+MAX_FILE_MB = 48          # stay under Telegram's 50 MB bot upload limit
+ASK_SONG    = 0           # ConversationHandler state
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -41,21 +48,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Shared YTMusic client (no auth needed for searching)
+# Shared YTMusic client — no auth needed for public search
 _ytm = YTMusic()
 
 
-# ── YTMusic search ───────────────────────────────────────────────────────────
-
-def ytm_search(query: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
-    """Return up to *limit* song results from YouTube Music."""
-    try:
-        results = _ytm.search(query, filter="songs", limit=limit)
-        return [r for r in results if r.get("videoId")]
-    except Exception:
-        logger.exception("YTMusic search failed for %r", query)
-        return []
-
+# ── Formatting helpers ────────────────────────────────────────────────────────
 
 def fmt_artists(artists: list[dict]) -> str:
     return ", ".join(a.get("name", "") for a in artists if a.get("name"))
@@ -64,113 +61,178 @@ def fmt_artists(artists: list[dict]) -> str:
 def fmt_duration(seconds: int | None) -> str:
     if not seconds:
         return ""
-    m, s = divmod(seconds, 60)
+    m, s = divmod(int(seconds), 60)
     return f"{m}:{s:02d}"
 
 
-# ── yt-dlp download ──────────────────────────────────────────────────────────
+def best_thumbnail(thumbnails: list[dict]) -> str:
+    """Return the highest-resolution thumbnail URL from a ytmusicapi list."""
+    if not thumbnails:
+        return ""
+    # ytmusicapi returns thumbnails sorted smallest → largest; take the last
+    return thumbnails[-1].get("url", "")
+
+
+# ── YTMusic search ────────────────────────────────────────────────────────────
+
+def ytm_search(query: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
+    """Return up to *limit* song dicts from YouTube Music."""
+    try:
+        results = _ytm.search(query, filter="songs", limit=limit)
+        return [r for r in results if r.get("videoId")]
+    except Exception:
+        logger.exception("YTMusic search failed for %r", query)
+        return []
+
+
+# ── yt-dlp audio download ─────────────────────────────────────────────────────
 
 def download_audio(video_id: str, tmpdir: str) -> tuple[str, dict]:
     """
-    Download the best available audio for *video_id* into *tmpdir*.
+    Download the best available audio stream for *video_id* into *tmpdir*.
+
     Returns (file_path, yt_dlp_info_dict).
-    Raises RuntimeError when the download fails or the file is too large.
+    Raises RuntimeError on failure or when the file exceeds MAX_FILE_MB.
     """
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    url     = f"https://www.youtube.com/watch?v={video_id}"
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
+    # Options with FFmpeg MP3 conversion
     ydl_opts: dict[str, Any] = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl": outtmpl,
-        "quiet": True,
+        "format":      "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl":     outtmpl,
+        "quiet":       True,
         "no_warnings": True,
-        "noplaylist": True,
+        "noplaylist":  True,
         "max_filesize": MAX_FILE_MB * 1024 * 1024,
-        # Remux to MP3 so Telegram's player recognises it properly
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
+        "postprocessors": [{
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": "192",
+        }],
+    }
+
+    # Options without FFmpeg (raw audio fallback)
+    ydl_opts_raw: dict[str, Any] = {
+        "format":      "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl":     outtmpl,
+        "quiet":       True,
+        "no_warnings": True,
+        "noplaylist":  True,
+        "max_filesize": MAX_FILE_MB * 1024 * 1024,
     }
 
     info: dict = {}
+    path: str  = ""
 
-    # First try with FFmpeg post-processing; fall back to raw audio if FFmpeg
-    # is not installed on this machine.
+    # --- attempt 1: with FFmpeg ---
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True) or {}
-            # After FFmpeg conversion the extension is .mp3
-            path = os.path.join(tmpdir, f"{video_id}.mp3")
-            if not os.path.exists(path):
-                path = ydl.prepare_filename(info)
-    except yt_dlp.utils.PostprocessingError:
-        # FFmpeg not available — download raw audio
-        ydl_opts_raw: dict[str, Any] = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "max_filesize": MAX_FILE_MB * 1024 * 1024,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts_raw) as ydl:
-            info = ydl.extract_info(url, download=True) or {}
-            path = ydl.prepare_filename(info)
-    except yt_dlp.utils.MaxDownloadsReached:
-        raise RuntimeError("Track exceeds the 48 MB size limit.")
+            # After FFmpeg conversion yt-dlp renames the file to .mp3
+            mp3_path = os.path.join(tmpdir, f"{video_id}.mp3")
+            path = mp3_path if os.path.exists(mp3_path) else ydl.prepare_filename(info)
+    except yt_dlp.utils.DownloadError as exc:
+        err = str(exc).lower()
+        if "ffmpeg" in err or "postprocess" in err or "ffprobe" in err:
+            # FFmpeg not installed — retry without post-processing
+            logger.info("FFmpeg unavailable, downloading raw audio for %s", video_id)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts_raw) as ydl:
+                    info = ydl.extract_info(url, download=True) or {}
+                    path = ydl.prepare_filename(info)
+            except yt_dlp.utils.DownloadError as exc2:
+                raise RuntimeError(str(exc2)) from exc2
+        else:
+            raise RuntimeError(str(exc)) from exc
     except Exception as exc:
         raise RuntimeError(str(exc)) from exc
 
-    if not os.path.exists(path):
-        files = [f for f in os.listdir(tmpdir) if not f.endswith(".part")]
-        if not files:
-            raise RuntimeError("Download produced no file.")
-        path = os.path.join(tmpdir, files[0])
+    # Fallback: scan tmpdir for any completed file
+    if not path or not os.path.exists(path):
+        candidates = [
+            f for f in os.listdir(tmpdir)
+            if not f.endswith(".part") and not f.endswith(".ytdl")
+        ]
+        if not candidates:
+            raise RuntimeError("Download produced no output file.")
+        path = os.path.join(tmpdir, candidates[0])
 
     size_mb = os.path.getsize(path) / (1024 * 1024)
     if size_mb > MAX_FILE_MB:
-        raise RuntimeError(f"Track is {size_mb:.0f} MB, which is too large to send.")
+        raise RuntimeError(
+            f"Track is {size_mb:.0f} MB — too large for Telegram (limit {MAX_FILE_MB} MB)."
+        )
 
     return path, info
 
 
-# ── Helper: build search result message and keyboard ─────────────────────────
+# ── UI builders ───────────────────────────────────────────────────────────────
 
-def build_results_ui(tracks: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
-    lines: list[str] = ["<b>🎵 Search results — tap one to download it</b>\n"]
+def build_results_message(tracks: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Build the search-results list message and its inline keyboard.
+    Each button opens the song detail view (shows info + download option).
+    """
+    lines: list[str] = ["<b>🎵 Search results</b>\n<i>Tap a song to see details and download it.</i>\n"]
     buttons: list[list[InlineKeyboardButton]] = []
 
     for i, track in enumerate(tracks, start=1):
-        title = html.escape(track.get("title") or "Unknown")
-        artist = html.escape(fmt_artists(track.get("artists") or []) or "Unknown")
-        album_info = track.get("album") or {}
-        album = html.escape(str(album_info.get("name") or ""))
-        dur = fmt_duration(track.get("duration_seconds"))
-        views = track.get("views") or ""
+        title   = html.escape(track.get("title") or "Unknown")
+        artists = html.escape(fmt_artists(track.get("artists") or []) or "Unknown")
+        album_d = track.get("album") or {}
+        album   = html.escape(str(album_d.get("name") or ""))
+        dur     = fmt_duration(track.get("duration_seconds"))
+        views   = track.get("views") or ""
 
-        line = f"{i}. <b>{title}</b> — {artist}"
+        line = f"{i}. <b>{title}</b> — {artists}"
         if album:
-            line += f"\n   <i>{album}</i>"
-        if dur:
-            line += f"  ·  {dur}"
-        if views:
-            line += f"  ·  {views} views"
+            line += f"\n    <i>{album}</i>"
+        extras = "  ·  ".join(filter(None, [dur, (f"{views} views" if views else "")]))
+        if extras:
+            line += f"\n    {extras}"
         lines.append(line)
 
-        label = f"{i}. {track.get('title', '')[:30]} — {fmt_artists(track.get('artists') or [])[:20]}"
-        buttons.append([
-            InlineKeyboardButton(label, callback_data=f"dl:{track['videoId']}")
-        ])
+        # callback_data must be ≤ 64 bytes; videoId is always 11 chars
+        vid = track["videoId"]
+        label = f"{i}. {track.get('title','')[:25]} — {fmt_artists(track.get('artists') or [])[:18]}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"info:{vid}")])
 
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+def build_song_detail(track: dict, video_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Build the per-song detail card text and action keyboard.
+    """
+    title   = html.escape(track.get("title") or "Unknown")
+    artists = html.escape(fmt_artists(track.get("artists") or []) or "Unknown")
+    album_d = track.get("album") or {}
+    album   = html.escape(str(album_d.get("name") or ""))
+    dur     = fmt_duration(track.get("duration_seconds"))
+    views   = track.get("views") or ""
+    yr      = track.get("year") or ""
+
+    lines = [f"🎵 <b>{title}</b>", f"👤 {artists}"]
+    if album:
+        lines.append(f"💿 {album}")
+    if dur:
+        lines.append(f"⏱ {dur}")
+    if yr:
+        lines.append(f"📅 {yr}")
+    if views:
+        lines.append(f"👁 {views} views")
+    lines.append(f"\n<a href='https://music.youtube.com/watch?v={video_id}'>Open in YouTube Music</a>")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬇️ Download & Send Audio", callback_data=f"dl:{video_id}")],
+        [InlineKeyboardButton("🔙 Back to results",       callback_data="back")],
+    ])
+    return "\n".join(lines), keyboard
+
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -178,9 +240,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await msg.reply_text(
         "🎵 <b>YouTube Music Bot</b>\n\n"
-        "I search YouTube Music and send you the audio file directly.\n\n"
-        "• Send a song name or <code>Song - Artist</code>\n"
-        "• Or use /search to be prompted step by step\n"
+        "Search YouTube Music and get the audio file sent straight to you.\n\n"
+        "• Type any song name or <code>Song - Artist</code>\n"
+        "• Or use /search for step-by-step prompts\n"
         "• /help — show this message again",
         parse_mode=ParseMode.HTML,
     )
@@ -190,159 +252,263 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_start(update, context)
 
 
-async def cmd_search(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Entry point for the /search conversation."""
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.effective_message
     if not msg:
         return ConversationHandler.END
 
-    # If the user typed /search <query> in one go, run it immediately
     if context.args:
-        query = " ".join(context.args).strip()
-        await _do_search(msg, query)
+        await _do_search(msg, " ".join(context.args).strip(), context)
         return ConversationHandler.END
 
-    await msg.reply_text("What song are you looking for? (send any text or /cancel)")
+    await msg.reply_text("What song are you looking for? (or /cancel)")
     return ASK_SONG
 
 
-async def receive_query(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Receive the free-text query in the conversation."""
+async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.effective_message
     if not msg or not msg.text:
         return ASK_SONG
-    await _do_search(msg, msg.text.strip())
+    await _do_search(msg, msg.text.strip(), context)
     return ConversationHandler.END
 
 
-async def cmd_cancel(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.effective_message
     if msg:
         await msg.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
-async def handle_plain_text(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Handle any plain message as a direct search query."""
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
         return
-    await _do_search(msg, msg.text.strip())
+    await _do_search(msg, msg.text.strip(), context)
 
 
-async def _do_search(msg: Any, query: str) -> None:
-    """Run a YTMusic search and send the results keyboard."""
+async def _do_search(msg: Any, query: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a YTMusic search and display the results keyboard."""
     if not query:
         await msg.reply_text("Please send a song name.")
         return
 
     status = await msg.reply_text("🔍 Searching YouTube Music…")
+    tracks = await _run_blocking(ytm_search, query)
 
-    tracks = ytm_search(query)
     if not tracks:
-        await status.edit_text(
-            f"No results found for <b>{html.escape(query)}</b>. Try different words.",
-            parse_mode=ParseMode.HTML,
-        )
+        await _safe_edit(status, f"No results for <b>{html.escape(query)}</b>. Try different words.")
         return
 
-    text, keyboard = build_results_ui(tracks)
-    await status.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    # Cache results so the detail view and back-button can reuse them
+    # without another network call.  Key = chat_id.
+    context.chat_data["last_tracks"]  = tracks
+    context.chat_data["last_query"]   = query
+
+    text, keyboard = build_results_message(tracks)
+    await _safe_edit(status, text, keyboard)
 
 
-async def handle_download_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Handle a tap on a search result — download and send the audio."""
-    query = update.callback_query
-    if not query:
+# ── Callback query handlers ───────────────────────────────────────────────────
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Single entry-point for all inline keyboard callbacks.
+
+    Patterns handled:
+        info:<videoId>   — show song detail card
+        dl:<videoId>     — download and send audio
+        back             — go back to the last results list
+        cancel           — dismiss the message
+    """
+    cq = update.callback_query
+    if not cq:
         return
-    await query.answer()
 
-    data = query.data or ""
-    if not data.startswith("dl:"):
-        return
-
-    video_id = data[3:]
-    if video_id == "cancel":
-        await query.edit_message_text("Cancelled.")
-        return
-
-    # Identify the track metadata from the original message text to build
-    # a nice caption.  We only have the videoId at this point so we re-fetch.
-    await query.edit_message_text("⬇️ Downloading audio, please wait…")
-
-    tmpdir = tempfile.mkdtemp(prefix="ytbot_")
+    # Always answer the callback query immediately so Telegram stops showing
+    # the loading spinner on the button — this must happen within 10 seconds.
     try:
-        path, dl_info = await _run_blocking(download_audio, video_id, tmpdir)
+        await cq.answer()
+    except Exception:
+        pass  # Already answered or timed out — not fatal
 
-        # Build caption from yt-dlp metadata (no extra network call needed)
-        title = dl_info.get("title") or ""
-        artist = dl_info.get("artist") or dl_info.get("uploader") or ""
-        album = dl_info.get("album") or ""
-        duration_secs = dl_info.get("duration")
+    data = (cq.data or "").strip()
 
-        caption_parts: list[str] = []
-        if title:
-            caption_parts.append(f"🎵 <b>{html.escape(title)}</b>")
-        if artist:
-            caption_parts.append(f"👤 {html.escape(artist)}")
-        if album:
-            caption_parts.append(f"💿 {html.escape(album)}")
-        dur = fmt_duration(int(duration_secs) if duration_secs else None)
-        if dur:
-            caption_parts.append(f"⏱ {dur}")
-        caption_parts.append(
-            f"\n<a href='https://music.youtube.com/watch?v={video_id}'>Open in YouTube Music</a>"
-        )
+    # ── cancel ────────────────────────────────────────────────────────────────
+    if data == "cancel":
+        await _safe_edit(cq.message, "Cancelled. Type a song name to search again.")
+        return
 
-        caption = "\n".join(caption_parts)
+    # ── back to results ───────────────────────────────────────────────────────
+    if data == "back":
+        tracks = context.chat_data.get("last_tracks")
+        if not tracks:
+            await _safe_edit(cq.message, "Session expired. Please search again.")
+            return
+        text, keyboard = build_results_message(tracks)
+        await _safe_edit(cq.message, text, keyboard)
+        return
 
-        chat = query.message.chat if query.message else None
-        if chat:
-            await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_VOICE)
+    # ── song detail view ──────────────────────────────────────────────────────
+    if data.startswith("info:"):
+        video_id = data[5:]
+        if not video_id:
+            await _safe_edit(cq.message, "❌ Invalid song ID.")
+            return
 
-        with open(path, "rb") as audio_file:
-            await context.bot.send_audio(
-                chat_id=query.message.chat_id,
-                audio=audio_file,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
+        tracks = context.chat_data.get("last_tracks") or []
+        track  = next((t for t in tracks if t.get("videoId") == video_id), None)
+
+        if not track:
+            await _safe_edit(cq.message, "❌ Could not find that song. Please search again.")
+            return
+
+        text, keyboard = build_song_detail(track, video_id)
+        thumb = best_thumbnail(track.get("thumbnails") or [])
+
+        if thumb:
+            # Try to send a new photo message with the detail card as caption.
+            # If that fails (e.g. the URL is invalid), fall back to plain text.
+            try:
+                await cq.message.reply_photo(
+                    photo=thumb,
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+                # Edit the original results message to a neutral prompt so the
+                # chat doesn't look cluttered.
+                await _safe_edit(
+                    cq.message,
+                    "⬆️ Song details above. Tap <b>Back to results</b> to search again.",
+                )
+                return
+            except Exception:
+                pass  # Fall through to plain-text edit
+
+        # Plain-text fallback (no thumbnail or photo send failed)
+        await _safe_edit(cq.message, text, keyboard)
+        return
+
+    # ── download & send ───────────────────────────────────────────────────────
+    if data.startswith("dl:"):
+        video_id = data[3:]
+        if not video_id:
+            await _safe_edit(cq.message, "❌ Invalid song ID.")
+            return
+
+        await _safe_edit(cq.message, "⬇️ Downloading audio — this usually takes 10–30 seconds…")
+
+        chat_id = cq.message.chat_id if cq.message else None
+        if not chat_id:
+            return
+
+        tmpdir = tempfile.mkdtemp(prefix="ytbot_")
+        try:
+            path, dl_info = await _run_blocking(download_audio, video_id, tmpdir)
+
+            # Build caption from yt-dlp metadata
+            title    = dl_info.get("title")    or ""
+            artist   = dl_info.get("artist")   or dl_info.get("uploader") or ""
+            album    = dl_info.get("album")     or ""
+            dur_secs = dl_info.get("duration")
+
+            parts: list[str] = []
+            if title:
+                parts.append(f"🎵 <b>{html.escape(title)}</b>")
+            if artist:
+                parts.append(f"👤 {html.escape(artist)}")
+            if album:
+                parts.append(f"💿 {html.escape(album)}")
+            d = fmt_duration(int(dur_secs) if dur_secs else None)
+            if d:
+                parts.append(f"⏱ {d}")
+            parts.append(
+                f"\n<a href='https://music.youtube.com/watch?v={video_id}'>"
+                f"Open in YouTube Music</a>"
+            )
+            caption = "\n".join(parts)
+
+            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+
+            with open(path, "rb") as f:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=f,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    title=title or None,
+                    performer=artist or None,
+                    duration=int(dur_secs) if dur_secs else None,
+                )
+
+            await _safe_edit(
+                cq.message,
+                "✅ Done! Type another song name or use /search to find more music.",
             )
 
-        await query.edit_message_text("✅ Sent! Use /search or just type a song name to find more.")
+        except RuntimeError as exc:
+            logger.warning("Download failed for %s: %s", video_id, exc)
+            await _safe_edit(cq.message, f"❌ {exc}")
+        except Exception:
+            logger.exception("Unexpected error downloading videoId=%s", video_id)
+            await _safe_edit(
+                cq.message,
+                "❌ Something went wrong. Please try again or search for a different song.",
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
 
-    except RuntimeError as exc:
-        await query.edit_message_text(f"❌ {exc}")
-    except Exception:
-        logger.exception("Download/send failed for videoId=%s", video_id)
-        await query.edit_message_text(
-            "❌ Something went wrong while downloading. Please try again."
+    # Unknown callback — ignore silently
+    logger.warning("Unhandled callback data: %r", data)
+
+
+# ── Safe message edit helper ──────────────────────────────────────────────────
+
+async def _safe_edit(
+    message: Any,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    """
+    Edit *message* text, swallowing harmless Telegram errors.
+
+    - BadRequest "message is not modified"  → silent skip
+    - BadRequest other                       → log and skip
+    - RetryAfter / TimedOut                  → log and skip
+    """
+    try:
+        await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
         )
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.warning("edit_text BadRequest: %s", exc)
+    except (RetryAfter, TimedOut) as exc:
+        logger.warning("edit_text rate-limit/timeout: %s", exc)
+    except Exception as exc:
+        logger.warning("edit_text failed: %s", exc)
 
 
-# ── Blocking helper ───────────────────────────────────────────────────────────
+# ── Thread-pool helper ────────────────────────────────────────────────────────
 
-import asyncio
-import functools
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+async def _run_blocking(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking / CPU-bound function in the default thread pool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
+
+# ── Railway health-check server ───────────────────────────────────────────────
 
 def _start_health_server() -> None:
     """
-    Start a minimal HTTP server on the port Railway (or any PaaS) expects.
-    Responds 200 OK to every request so the platform health check passes.
+    Spin up a minimal HTTP server on $PORT (default 8080) in a daemon thread
+    so Railway's health-check passes.  The bot itself uses long polling and
+    does not need this port for Telegram traffic.
     """
     port = int(os.environ.get("PORT", 8080))
 
@@ -352,59 +518,58 @@ def _start_health_server() -> None:
             self.end_headers()
             self.wfile.write(b"OK")
 
-        def log_message(self, *args):  # silence request logs
-            pass
+        def log_message(self, *args):
+            pass  # silence access logs
 
     server = HTTPServer(("0.0.0.0", port), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
     logger.info("Health-check server listening on port %d", port)
-
-
-async def _run_blocking(fn, *args, **kwargs):
-    """Run a blocking function in the default thread pool."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 
 # ── Error handler ─────────────────────────────────────────────────────────────
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled error", exc_info=context.error)
+    logger.error("Unhandled update error", exc_info=context.error)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    # Support both Railway's default BOT_TOKEN and the explicit name
+    token = (
+        os.environ.get("TELEGRAM_BOT_TOKEN")
+        or os.environ.get("BOT_TOKEN")
+    )
     if not token:
         raise SystemExit(
-            "Set TELEGRAM_BOT_TOKEN to your BotFather token before starting."
+            "Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN) to your BotFather token."
         )
 
-    # Satisfy Railway / any PaaS that requires an HTTP port to be open
     _start_health_server()
 
     app = Application.builder().token(token).build()
 
-    # Conversation: /search → (optional) query text
+    # /search conversation
     search_conv = ConversationHandler(
         entry_points=[CommandHandler("search", cmd_search)],
         states={
-            ASK_SONG: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_query)
-            ],
+            ASK_SONG: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_query)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(search_conv)
-    app.add_handler(CallbackQueryHandler(handle_download_callback, pattern=r"^dl:"))
-    # Any plain text outside the conversation triggers a direct search
+
+    # One handler covers ALL callback patterns: info:, dl:, back, cancel
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Plain text outside any conversation → direct search
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
+
     app.add_error_handler(handle_error)
 
     logger.info("Bot starting — polling for updates…")
