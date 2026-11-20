@@ -779,8 +779,10 @@ def build_track_detail(track: dict, index: int) -> tuple[str, InlineKeyboardMark
 
     buttons: list[list[InlineKeyboardButton]] = []
 
-    # Download row — only when the source permits it
-    if can_dl and track.get("download_url"):
+    # Download row — always show when a download URL exists.
+    # If the source blocks the download, the user gets a clear error message
+    # ([DOWNLOAD_FAILED]) rather than a missing button.
+    if track.get("download_url"):
         buttons.append([InlineKeyboardButton("⬇️ Download", callback_data=f"dl:{index}")])
 
     # Listen (URL button) + Back row
