@@ -2,3 +2,7 @@
 /cookies.txt
 /tests/
 /.idea/
+/downloads/
+/sessions/
+*.session
+*.session-journal
