@@ -633,20 +633,61 @@ async def multi_search(
 
 # ── yt-dlp audio download ─────────────────────────────────────────────────────
 
+def _find_js_runtime() -> str:
+    """Return the first available JavaScript runtime path, or ''."""
+    for name in ("deno", "node", "nodejs"):
+        path = shutil.which(name)
+        if path:
+            logger.info("JS_RUNTIME found=%s path=%s", name, path)
+            return name
+    logger.warning("JS_RUNTIME none found — YouTube may fail to extract formats")
+    return ""
+
+
+def _log_available_formats(url: str) -> None:
+    """Fetch info without downloading and log the available formats."""
+    try:
+        probe_opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "logger": _YTDL_LOGGER,
+            "skip_download": True,
+        }
+        if _COOKIEFILE and os.path.exists(_COOKIEFILE):
+            probe_opts["cookiefile"] = _COOKIEFILE
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        fmts = info.get("formats") or []
+        logger.error(
+            "FORMATS_AVAILABLE url=%r count=%d formats=%s",
+            url, len(fmts),
+            [(f.get("format_id"), f.get("ext"), f.get("acodec"))
+             for f in fmts[:15]],
+        )
+    except Exception:
+        logger.exception("FORMATS_PROBE_FAILED url=%r", url)
+
+
 def download_audio(url: str, tmpdir: str) -> tuple[str, dict]:
     """
     Download *url* into *tmpdir*, remux to MP3 if FFmpeg is available.
     Returns (file_path, info_dict).
-    Raises RuntimeError("DOWNLOAD_FAILED" | "FILE_TOO_LARGE").
+    Raises RuntimeError("DOWNLOAD_FAILED" | "FILE_TOO_LARGE" | "YOUTUBE_BLOCKED").
     """
     logger.info("DOWNLOAD_START url=%r tmpdir=%r", url, tmpdir)
 
     has_ffmpeg = _ffmpeg_available()
-    logger.info("DOWNLOAD ffmpeg=%s", has_ffmpeg)
+    js_runtime = _find_js_runtime()
+    logger.info("DOWNLOAD ffmpeg=%s js_runtime=%s", has_ffmpeg, js_runtime)
 
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+
+    # Format string with fallbacks so a missing single format doesn't hard-fail
+    fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+
     opts: dict[str, Any] = {
-        "format":           "bestaudio/best",
+        "format":           fmt,
         "outtmpl":          outtmpl,
         "quiet":            False,
         "no_warnings":      False,
@@ -655,7 +696,23 @@ def download_audio(url: str, tmpdir: str) -> tuple[str, dict]:
         "retries":          3,
         "fragment_retries": 3,
         "logger":           _YTDL_LOGGER,
+        # Avoid the web_music client — it requires a GVS PO Token that
+        # datacenter IPs can't obtain.  tv and web_safari are more lenient.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv", "web_safari"],
+            },
+        },
     }
+
+    # Tell yt-dlp which JS runtime to use for signature/n-challenge solving.
+    # yt-dlp expects a dict: {"runtime_name": {config}}
+    # deno is enabled by default; node/quickjs need the EJS scripts installed.
+    if js_runtime:
+        opts["js_runtimes"] = {js_runtime: {}}
+        # Download EJS challenge solver scripts from GitHub as a fallback
+        # when yt-dlp-ejs isn't installed as a package.
+        opts["remote_components"] = {"ejs:github"}
 
     if has_ffmpeg:
         opts["postprocessors"] = [{
@@ -676,6 +733,8 @@ def download_audio(url: str, tmpdir: str) -> tuple[str, dict]:
             info = ydl.extract_info(url, download=True) or {}
     except yt_dlp.utils.DownloadError as exc:
         err_msg = str(exc).lower()
+        # Log available formats for diagnosis before raising
+        _log_available_formats(url)
         # Detect YouTube bot-detection specifically so we can give a
         # helpful "try SoundCloud instead" message to the user.
         if any(kw in err_msg for kw in (
@@ -1239,11 +1298,12 @@ def main() -> None:
 
     print(f"yt-dlp version  : {yt_dlp.version.__version__}", flush=True)
     print(f"FFmpeg available: {_ffmpeg_available()}", flush=True)
+    print(f"JS runtime      : {_find_js_runtime() or 'none (downloads may fail)'}", flush=True)
     print(f"YouTube Music   : {'available' if _ytm else 'unavailable (ytmusicapi not installed)'}", flush=True)
     print(f"httpx           : {'available' if httpx else 'unavailable'}", flush=True)
-    logger.info("STARTUP yt_dlp=%s ffmpeg=%s ytmusic=%s httpx=%s",
+    logger.info("STARTUP yt_dlp=%s ffmpeg=%s js_runtime=%s ytmusic=%s httpx=%s",
                 yt_dlp.version.__version__, _ffmpeg_available(),
-                bool(_ytm), bool(httpx))
+                _find_js_runtime(), bool(_ytm), bool(httpx))
 
     _COOKIEFILE = _setup_cookies()
 

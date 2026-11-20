@@ -1,0 +1,51 @@
+Test URL: https://music.youtube.com/watch?v=H9NJenpBV2I
+yt-dlp version: 2026.08.19
+FFmpeg: True
+2026-11-20 20:48:38,192 INFO music_bot: JS_RUNTIME found=node path=C:\Program Files\nodejs\node.EXE
+JS runtime: node
+Cookies: False
+
+tmpdir: C:\Users\OFfsIdE\AppData\Local\Temp\test_dl_9hbqq09d
+2026-11-20 20:48:38,194 INFO music_bot: DOWNLOAD_START url='https://music.youtube.com/watch?v=H9NJenpBV2I' tmpdir='C:\\Users\\OFfsIdE\\AppData\\Local\\Temp\\test_dl_9hbqq09d'
+2026-11-20 20:48:38,204 INFO music_bot: JS_RUNTIME found=node path=C:\Program Files\nodejs\node.EXE
+2026-11-20 20:48:38,204 INFO music_bot: DOWNLOAD ffmpeg=True js_runtime=node
+2026-11-20 20:48:45,350 ERROR music_bot: yt-dlp: ERROR: [youtube] H9NJenpBV2I: The page needs to be reloaded.
+2026-11-20 20:48:47,145 WARNING music_bot: yt-dlp: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-11-20 20:48:50,550 ERROR music_bot: FORMATS_AVAILABLE url='https://music.youtube.com/watch?v=H9NJenpBV2I' count=43 formats=[('sb3', 'mhtml', 'none'), ('sb2', 'mhtml', 'none'), ('sb1', 'mhtml', 'none'), ('sb0', 'mhtml', 'none'), ('233', 'mp4', None), ('234', 'mp4', None), ('139', 'm4a', 'mp4a.40.5'), ('249', 'webm', 'opus'), ('250', 'webm', 'opus'), ('140', 'm4a', 'mp4a.40.2'), ('251', 'webm', 'opus'), ('602', 'mp4', 'none'), ('269', 'mp4', 'none'), ('160', 'mp4', 'none'), ('603', 'mp4', 'none')]
+2026-11-20 20:48:50,550 ERROR music_bot: DOWNLOAD_FAILED [DownloadError] url='https://music.youtube.com/watch?v=H9NJenpBV2I'
+Traceback (most recent call last):
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1731, in wrapper
+    return func(self, *args, **kwargs)
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1866, in __extract_info
+    ie_result = ie.extract(url)
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\extractor\common.py", line 765, in extract
+    ie_result = self._real_extract(url)
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\extractor\youtube\_video.py", line 4076, in _real_extract
+    self.raise_no_formats(reason, expected=True)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\extractor\common.py", line 1272, in raise_no_formats
+    raise ExtractorError(msg, expected=expected, video_id=video_id)
+yt_dlp.utils.ExtractorError: [youtube] H9NJenpBV2I: The page needs to be reloaded.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\OFfsIdE\Desktop\PHP\music_bot.py", line 729, in download_audio
+    info = ydl.extract_info(url, download=True) or {}
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1720, in extract_info
+    return self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1749, in wrapper
+    self.report_error(str(e), e.format_traceback())
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1165, in report_error
+    self.trouble(f'{self._format_err("ERROR:", self.Styles.ERROR)} {message}', *args, **kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OFfsIdE\AppData\Local\Programs\Python\Python313\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1103, in trouble
+    raise DownloadError(message, exc_info)
+yt_dlp.utils.DownloadError: ERROR: [youtube] H9NJenpBV2I: The page needs to be reloaded.
+
+DOWNLOAD FAILED: DOWNLOAD_FAILED
+
+DONE
