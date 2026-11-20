@@ -1,0 +1,14 @@
+# Never commit cookies or secrets
+cookies.txt
+*.cookies
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
