@@ -335,6 +335,30 @@ async def handle_download_callback(
 
 import asyncio
 import functools
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def _start_health_server() -> None:
+    """
+    Start a minimal HTTP server on the port Railway (or any PaaS) expects.
+    Responds 200 OK to every request so the platform health check passes.
+    """
+    port = int(os.environ.get("PORT", 8080))
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, *args):  # silence request logs
+            pass
+
+    server = HTTPServer(("0.0.0.0", port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health-check server listening on port %d", port)
 
 
 async def _run_blocking(fn, *args, **kwargs):
@@ -357,6 +381,9 @@ def main() -> None:
         raise SystemExit(
             "Set TELEGRAM_BOT_TOKEN to your BotFather token before starting."
         )
+
+    # Satisfy Railway / any PaaS that requires an HTTP port to be open
+    _start_health_server()
 
     app = Application.builder().token(token).build()
 
